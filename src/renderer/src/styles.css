@@ -65,6 +65,53 @@ button { cursor: pointer; font: inherit; }
 .connect-dialog-orb { position: absolute; width: 210px; height: 210px; top: -145px; right: 14px; border-radius: 999px; border: 1px solid rgba(255,255,255,.18); box-shadow: 0 0 0 24px rgba(255,255,255,.035), 0 0 0 52px rgba(255,255,255,.025); }
 .connect-action { background: linear-gradient(110deg, #6256d9, #7665ea); box-shadow: 0 5px 14px rgba(94,80,207,.25); }
 .connect-action:not(:disabled):hover { box-shadow: 0 8px 18px rgba(94,80,207,.34); }
+
+@media (max-width: 1279px) {
+  .app-sidebar {
+    width: 72px;
+    padding-left: 8px;
+    padding-right: 8px;
+    transition: width .2s ease, padding .2s ease, box-shadow .2s ease;
+  }
+  .app-sidebar:hover,
+  .app-sidebar:focus-within {
+    width: 250px;
+    padding-left: 16px;
+    padding-right: 16px;
+    z-index: 30;
+    box-shadow: 16px 0 38px rgba(20, 25, 64, .28);
+  }
+  .app-main { margin-left: 72px; }
+  .app-sidebar > div:first-child { justify-content: center; padding-left: 0; padding-right: 0; }
+  .app-sidebar:hover > div:first-child,
+  .app-sidebar:focus-within > div:first-child { justify-content: flex-start; padding-left: 8px; padding-right: 8px; }
+  .app-sidebar .sidebar-copy,
+  .app-sidebar .sidebar-company-copy,
+  .app-sidebar .sidebar-chevron,
+  .app-sidebar .sidebar-heading,
+  .app-sidebar .sidebar-indicator {
+    display: none;
+  }
+  .app-sidebar:hover .sidebar-copy,
+  .app-sidebar:focus-within .sidebar-copy,
+  .app-sidebar:hover .sidebar-company-copy,
+  .app-sidebar:focus-within .sidebar-company-copy,
+  .app-sidebar:hover .sidebar-chevron,
+  .app-sidebar:focus-within .sidebar-chevron,
+  .app-sidebar:hover .sidebar-heading,
+  .app-sidebar:focus-within .sidebar-heading,
+  .app-sidebar:hover .sidebar-indicator,
+  .app-sidebar:focus-within .sidebar-indicator {
+    display: block;
+  }
+  .app-sidebar button { justify-content: center; padding-left: 0; padding-right: 0; white-space: nowrap; }
+  .app-sidebar:hover button,
+  .app-sidebar:focus-within button { justify-content: flex-start; padding-left: 12px; padding-right: 12px; }
+  .app-sidebar .company-switch { padding: 8px; }
+  .app-sidebar:hover .company-switch,
+  .app-sidebar:focus-within .company-switch { padding: 12px; }
+}
+
 .auth-shell { background: radial-gradient(ellipse at 12% 8%, #e7e9ff 0, transparent 30%), radial-gradient(ellipse at 88% 92%, #e7f1ff 0, transparent 32%), linear-gradient(135deg, #f7f8ff, #f1f4fc 55%, #f8faff); }
 .auth-showcase { background: linear-gradient(145deg, #34358e 0%, #5149c8 48%, #7869e8 100%); }
 .auth-orb { position: absolute; border: 1px solid rgba(255,255,255,.14); border-radius: 999px; pointer-events: none; }

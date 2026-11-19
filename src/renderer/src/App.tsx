@@ -1,3 +1,4 @@
+import type { Session } from "@supabase/supabase-js";
 import {
   AlertCircle,
   ArrowDownToLine,
@@ -7,11 +8,13 @@ import {
   BookOpenText,
   Check,
   ChevronDown,
+  ClipboardList,
   CircleHelp,
   Command,
   FileText,
   LayoutDashboard,
   LogOut,
+  NotebookTabs,
   Search,
   Settings2,
   ShieldCheck,
@@ -23,8 +26,12 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { Session } from "@supabase/supabase-js";
 import AuthScreen from "./AuthScreen";
+import SalesInvoiceTable from "./SalesInvoiceTable";
+import DayBookTable from "./DayBookTable";
+import OrdersModule from "./OrdersModule";
+import DashboardSummary from "./DashboardSummary";
+import HelpGuide from "./HelpGuide";
 import { supabase } from "./supabase";
 
 type UpdateStatus = { status: string; detail?: string };
@@ -35,7 +42,11 @@ type SalesRow = {
   amount: number;
   received: number;
   balance: number;
+  voucherType?: string;
+  items?: Array<{ name: string; quantity: string }>;
 };
+type DayBookSale = { date: string; party: string; amount: number; items: Array<{ name: string; quantity: string }> };
+type DayBookPayment = { date: string; party: string; amount: number };
 
 function localDate(date: Date) {
   const year = date.getFullYear();
@@ -45,26 +56,21 @@ function localDate(date: Date) {
 }
 
 const today = new Date();
-const fiscalYearStart = `${today.getFullYear() - (today.getMonth() < 3 ? 1 : 0)}-04-01`;
+const defaultTallyPort = "9000";
+const savedTallyPort = () => {
+  const saved = localStorage.getItem("tallylink-port");
+  const port = Number(saved);
+  return saved && Number.isInteger(port) && port >= 1 && port <= 65535
+    ? saved
+    : defaultTallyPort;
+};
 const todayIso = localDate(today);
+const defaultReportFrom = localDate(new Date(today.getFullYear(), today.getMonth(), 1));
 const formatMoney = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
   maximumFractionDigits: 2,
 });
-const formatReportDate = (value: string) =>
-  new Intl.DateTimeFormat("en-IN", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  }).format(new Date(`${value}T00:00:00`));
-const daysSince = (value: string) => {
-  const voucherDay = Date.parse(`${value}T00:00:00Z`);
-  const todayDay = Date.parse(`${todayIso}T00:00:00Z`);
-  return Number.isFinite(voucherDay)
-    ? Math.max(0, Math.floor((todayDay - voucherDay) / 86_400_000))
-    : "—";
-};
 
 const reportIdeas = [
   {
@@ -75,11 +81,11 @@ const reportIdeas = [
     tag: "POPULAR",
   },
   {
-    title: "Payment tracking",
-    detail: "See what came in and what is still due",
-    icon: WalletCards,
+    title: "Day Book",
+    detail: "Review daily sales and payments",
+    icon: NotebookTabs,
     color: "mint",
-    tag: "CASH FLOW",
+    tag: "DAILY ACTIVITY",
   },
   {
     title: "Ledger explorer",
@@ -99,7 +105,8 @@ export default function App() {
   const [comingSoonTip, setComingSoonTip] = useState("");
   const [comingSoonTipHovered, setComingSoonTipHovered] = useState(false);
   const companyMenuRef = useRef<HTMLDivElement>(null);
-  const [tallyPort, setTallyPort] = useState("9000");
+  const partyFetchRequestRef = useRef(0);
+  const [tallyPort, setTallyPort] = useState(savedTallyPort);
   const [connection, setConnection] = useState<{
     status: "idle" | "connecting" | "connected" | "error";
     error?: string;
@@ -112,20 +119,34 @@ export default function App() {
   const [selectedCompany, setSelectedCompany] = useState(
     () => localStorage.getItem("tallylink-company") ?? "",
   );
-  const [activeView, setActiveView] = useState<"overview" | "sales">(
+  const [activeView, setActiveView] = useState<"overview" | "sales" | "daybook" | "orders" | "help">(
     "overview",
   );
   const [reportStatus, setReportStatus] = useState<
     "idle" | "loading" | "loaded" | "error"
   >("idle");
   const [reportRows, setReportRows] = useState<SalesRow[]>([]);
+  const [ledgerOutstandingRows, setLedgerOutstandingRows] = useState<SalesRow[]>([]);
+  const [ledgerOutstandingsLoaded, setLedgerOutstandingsLoaded] = useState(false);
+  const [ledgerDetailLoading, setLedgerDetailLoading] = useState(false);
+  const [ledgerDetailError, setLedgerDetailError] = useState("");
+  const [partyVoucherRows, setPartyVoucherRows] = useState<SalesRow[]>([]);
+  const [partyVouchersLoading, setPartyVouchersLoading] = useState(false);
+  const [partyVoucherError, setPartyVoucherError] = useState("");
   const [reportError, setReportError] = useState("");
+  const [dayBookStatus, setDayBookStatus] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [dayBookError, setDayBookError] = useState("");
+  const [dayBookSales, setDayBookSales] = useState<DayBookSale[]>([]);
+  const [dayBookPayments, setDayBookPayments] = useState<DayBookPayment[]>([]);
   const [partySearch, setPartySearch] = useState("");
   const [selectedParty, setSelectedParty] = useState("");
-  const [reportFrom, setReportFrom] = useState(fiscalYearStart);
+  const [showSettledInvoices, setShowSettledInvoices] = useState(false);
+  const [reportFrom, setReportFrom] = useState(defaultReportFrom);
   const [reportTo, setReportTo] = useState(todayIso);
+  const [dayBookFrom, setDayBookFrom] = useState(todayIso);
+  const [dayBookTo, setDayBookTo] = useState(todayIso);
   const [launchReportAfterSelection, setLaunchReportAfterSelection] =
-    useState(false);
+    useState<"sales" | "daybook" | null>(null);
   useEffect(() => {
     if (!supabase) {
       setAuthReady(true);
@@ -138,16 +159,24 @@ export default function App() {
         setAuthReady(true);
       }
     });
-    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
-      setAuthSession(session);
-      setAuthReady(true);
-    });
+    const { data: authListener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        setAuthSession(session);
+        setAuthReady(true);
+      },
+    );
     return () => {
       mounted = false;
       authListener.subscription.unsubscribe();
     };
   }, []);
   useEffect(() => window.desktop.onUpdateStatus(setUpdate), []);
+  useEffect(() => {
+    const port = Number(tallyPort);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+      localStorage.setItem("tallylink-port", String(port));
+    }
+  }, [tallyPort]);
   useEffect(() => {
     if (!companyMenuOpen) return;
     const closeOnOutsideClick = (event: MouseEvent) => {
@@ -221,22 +250,27 @@ export default function App() {
     setSelectedCompany(companyDraft);
     setConnectOpen(false);
     if (launchReportAfterSelection) {
-      setLaunchReportAfterSelection(false);
-      void loadSalesReport(companyDraft);
+      const pendingView = launchReportAfterSelection;
+      setLaunchReportAfterSelection(null);
+      if (pendingView === "sales") void loadSalesReport(companyDraft);
+      else void loadDayBook(companyDraft);
     }
   };
 
   const loadSalesReport = async (company = selectedCompany) => {
     if (!company) {
-      setLaunchReportAfterSelection(true);
+      setLaunchReportAfterSelection("sales");
       setConnectOpen(true);
       return;
     }
     if (connection.status !== "connected") {
-      setLaunchReportAfterSelection(true);
+      setLaunchReportAfterSelection("sales");
       setConnectOpen(true);
       return;
     }
+    partyFetchRequestRef.current += 1;
+    setLedgerDetailLoading(false);
+    setPartyVouchersLoading(false);
     setActiveView("sales");
     setReportStatus("loading");
     setReportError("");
@@ -251,6 +285,7 @@ export default function App() {
         port: connection.port ?? Number(tallyPort),
         fromDate: reportFrom,
         toDate: reportTo,
+        mode: "receivables",
       });
       if (!result.ok)
         throw new Error(
@@ -258,6 +293,12 @@ export default function App() {
         );
       const rows = result.rows ?? [];
       setReportRows(rows);
+      setLedgerOutstandingRows([]);
+      setLedgerOutstandingsLoaded(false);
+      setLedgerDetailError("");
+      setPartyVoucherRows([]);
+      setPartyVoucherError("");
+      setShowSettledInvoices(false);
       setSelectedParty((current) =>
         current && rows.some((row) => row.party === current) ? current : "",
       );
@@ -265,6 +306,77 @@ export default function App() {
     } catch (error) {
       setReportError(error instanceof Error ? error.message : String(error));
       setReportStatus("error");
+    }
+  };
+
+  const loadDayBook = async (company = selectedCompany) => {
+    if (!company) {
+      setLaunchReportAfterSelection("daybook");
+      setActiveView("daybook");
+      setConnectOpen(true);
+      return;
+    }
+    if (connection.status !== "connected") {
+      setLaunchReportAfterSelection("daybook");
+      setActiveView("daybook");
+      setConnectOpen(true);
+      return;
+    }
+    setActiveView("daybook");
+    setDayBookStatus("loading");
+    setDayBookError("");
+    try {
+      const result = await window.desktop.fetchDayBook({
+        company,
+        port: connection.port ?? Number(tallyPort),
+        fromDate: dayBookFrom,
+        toDate: dayBookTo,
+      });
+      if (!result.ok) throw new Error(result.error || "Tally could not return the Day Book.");
+      setDayBookSales(result.sales ?? []);
+      setDayBookPayments(result.payments ?? []);
+      setDayBookStatus("loaded");
+    } catch (error) {
+      setDayBookError(error instanceof Error ? error.message : String(error));
+      setDayBookStatus("error");
+    }
+  };
+
+  const selectPartyLedger = async (party: string) => {
+    const requestId = ++partyFetchRequestRef.current;
+    setSelectedParty(party);
+    setShowSettledInvoices(false);
+    setPartyVouchersLoading(false);
+    setPartyVoucherRows([]);
+    setPartyVoucherError("");
+    setLedgerOutstandingRows([]);
+    // Don't briefly present the all-party bill report as if it were the
+    // selected ledger's complete bill-wise + on-account detail.
+    setLedgerOutstandingsLoaded(true);
+    setLedgerDetailLoading(true);
+    setLedgerDetailError("");
+    try {
+      const result = await window.desktop.fetchSalesReport({
+        company: selectedCompany,
+        port: connection.port ?? Number(tallyPort),
+        fromDate: reportFrom,
+        toDate: reportTo,
+        mode: "ledger-outstandings",
+        party,
+      });
+      if (requestId !== partyFetchRequestRef.current) return;
+      if (!result.ok) throw new Error(result.error || "Could not load this ledger's outstanding details.");
+      const rows = result.rows ?? [];
+      if (!rows.length && reportRows.some((row) => row.party === party)) {
+        throw new Error("Tally returned no readable ledger detail for a party with open bills. No partial ledger was shown; refresh and try again.");
+      }
+      setLedgerOutstandingRows(rows);
+      setLedgerOutstandingsLoaded(true);
+    } catch (error) {
+      if (requestId !== partyFetchRequestRef.current) return;
+      setLedgerDetailError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (requestId === partyFetchRequestRef.current) setLedgerDetailLoading(false);
     }
   };
 
@@ -290,8 +402,46 @@ export default function App() {
     ledger.name.toLocaleLowerCase().includes(partySearch.toLocaleLowerCase()),
   );
   const filteredReportRows = selectedParty
-    ? reportRows.filter((row) => row.party === selectedParty)
+    ? (showSettledInvoices
+        ? partyVoucherRows
+        : ledgerOutstandingsLoaded
+          ? ledgerOutstandingRows
+          : reportRows
+      ).filter((row) => row.party === selectedParty)
     : [];
+  const outstandingInvoices = filteredReportRows
+    .filter((row) => row.balance > 0.005)
+    .sort((a, b) => b.date.localeCompare(a.date) || b.balance - a.balance);
+  const tableRows = showSettledInvoices ? filteredReportRows : outstandingInvoices;
+  const toggleSettledView = async () => {
+    if (!selectedParty || partyVouchersLoading) return;
+    if (!showSettledInvoices) {
+      const requestId = ++partyFetchRequestRef.current;
+      setPartyVouchersLoading(true);
+      setPartyVoucherError("");
+      try {
+        const result = await window.desktop.fetchSalesReport({
+          company: selectedCompany,
+          port: connection.port ?? Number(tallyPort),
+          fromDate: reportFrom,
+          toDate: reportTo,
+          mode: "party-vouchers",
+          party: selectedParty,
+        });
+        if (requestId !== partyFetchRequestRef.current) return;
+        if (!result.ok) throw new Error(result.error || "Could not load this party's ledger movements.");
+        setPartyVoucherRows(result.rows ?? []);
+        setShowSettledInvoices(true);
+      } catch (error) {
+        if (requestId !== partyFetchRequestRef.current) return;
+        setPartyVoucherError(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (requestId === partyFetchRequestRef.current) setPartyVouchersLoading(false);
+      }
+    } else {
+      setShowSettledInvoices(false);
+    }
+  };
   const reportTotals = filteredReportRows.reduce(
     (totals, row) => ({
       sales: totals.sales + row.amount,
@@ -302,18 +452,25 @@ export default function App() {
   );
 
   if (!authReady) {
-    return <div className="auth-shell grid min-h-screen place-items-center"><div className="h-9 w-9 animate-spin rounded-full border-[3px] border-indigo-100 border-t-indigo-600" aria-label="Checking your session" /></div>;
+    return (
+      <div className="auth-shell grid min-h-screen place-items-center">
+        <div
+          className="h-9 w-9 animate-spin rounded-full border-[3px] border-indigo-100 border-t-indigo-600"
+          aria-label="Checking your session"
+        />
+      </div>
+    );
   }
   if (!authSession) return <AuthScreen />;
 
   return (
     <div className="app-shell min-h-screen text-slate-900">
-      <aside className="sidebar fixed inset-y-0 left-0 z-20 flex w-[250px] flex-col px-4 text-white">
+      <aside className="sidebar app-sidebar fixed inset-y-0 left-0 z-20 flex w-[250px] flex-col px-4 text-white">
         <div className="flex h-[76px] items-center gap-3 border-b border-white/[0.09] px-2">
           <div className="brand-mark grid h-10 w-10 place-items-center rounded-[14px] text-white">
             <Command size={20} strokeWidth={2.4} />
           </div>
-          <div>
+          <div className="sidebar-copy">
             <div className="text-[16px] font-bold tracking-[-0.04em]">
               TallyLink
             </div>
@@ -327,6 +484,7 @@ export default function App() {
           <button
             type="button"
             aria-label="Switch Tally company"
+            title="Switch Tally company"
             aria-haspopup="listbox"
             aria-expanded={companyMenuOpen}
             onClick={() => setCompanyMenuOpen((open) => !open)}
@@ -335,7 +493,7 @@ export default function App() {
             <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-amber-300 to-orange-400 text-amber-950 shadow-lg shadow-orange-950/30">
               <BookOpenText size={17} />
             </span>
-            <span className="min-w-0 flex-1">
+            <span className="sidebar-company-copy min-w-0 flex-1">
               <span className="block text-[10px] font-bold uppercase tracking-[0.12em] text-indigo-100/75">
                 Tally Company
               </span>
@@ -348,7 +506,10 @@ export default function App() {
                   : "Not connected"}
               </span>
             </span>
-            <ChevronDown size={15} className={`shrink-0 text-indigo-100/65 transition-transform ${companyMenuOpen ? "rotate-180" : ""}`} />
+            <ChevronDown
+              size={15}
+              className={`sidebar-chevron shrink-0 text-indigo-100/65 transition-transform ${companyMenuOpen ? "rotate-180" : ""}`}
+            />
           </button>
           {companyMenuOpen && (
             <div
@@ -371,53 +532,111 @@ export default function App() {
                       setSelectedParty("");
                       localStorage.setItem("tallylink-company", company);
                       if (activeView === "sales") void loadSalesReport(company);
+                      if (activeView === "daybook") void loadDayBook(company);
                     }}
                     className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-[12px] font-semibold transition ${selectedCompany === company ? "bg-indigo-50 text-indigo-800" : "text-slate-700 hover:bg-slate-50 hover:text-slate-950"}`}
                   >
                     <span className="truncate">{company}</span>
-                    {selectedCompany === company && <Check size={14} className="ml-2 shrink-0 text-indigo-600" />}
+                    {selectedCompany === company && (
+                      <Check
+                        size={14}
+                        className="ml-2 shrink-0 text-indigo-600"
+                      />
+                    )}
                   </button>
                 ))
               ) : (
                 <div className="px-3 py-3 text-[12px] leading-5 text-slate-500">
-                  No companies found. Open the connection settings to refresh Tally.
+                  No companies found. Open the connection settings to refresh
+                  Tally.
                 </div>
               )}
             </div>
           )}
         </div>
 
-        <div className="nav-label mt-8 px-3">WORKSPACE</div>
+        <div className="nav-label sidebar-heading mt-8 px-3">WORKSPACE</div>
         <button
+          title="Overview"
           onClick={() => setActiveView("overview")}
           className={`${activeView === "overview" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold transition`}
         >
-          <LayoutDashboard size={17} /> Overview{" "}
+          <LayoutDashboard size={17} />{" "}
+          <span className="sidebar-copy">Overview</span>{" "}
           {activeView === "overview" && (
-            <span className="ml-auto h-1.5 w-1.5 rounded-full bg-cyan-300 shadow-[0_0_9px_2px_rgba(103,232,249,.65)]" />
+            <span className="sidebar-indicator ml-auto h-1.5 w-1.5 rounded-full bg-cyan-300 shadow-[0_0_9px_2px_rgba(103,232,249,.65)]" />
           )}
         </button>
-        <div className="nav-label mt-8 px-3">YOUR REPORTS</div>
+        <div className="nav-label sidebar-heading mt-8 px-3">YOUR REPORTS</div>
         <button
+          title="Sales & collections"
           onClick={() => void loadSalesReport()}
           className={`${activeView === "sales" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-[12px] font-semibold transition`}
         >
-          <TrendingUp size={16} /> Sales & collections
+          <TrendingUp size={16} />{" "}
+          <span className="sidebar-copy">Sales & collections</span>
+        </button>
+        <button
+          title="Day Book"
+          onClick={() => void loadDayBook()}
+          className={`${activeView === "daybook" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-[12px] font-semibold transition`}
+        >
+          <NotebookTabs size={16} />
+          <span className="sidebar-copy">Day Book</span>
+          {activeView === "daybook" && (
+            <span className="sidebar-indicator ml-auto h-1.5 w-1.5 rounded-full bg-cyan-300 shadow-[0_0_9px_2px_rgba(103,232,249,.65)]" />
+          )}
+        </button>
+
+        <button
+          title="Orders"
+          onClick={() => setActiveView("orders")}
+          className={`${activeView === "orders" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-[12px] font-semibold transition`}
+        >
+          <ClipboardList size={16} />
+          <span className="sidebar-copy">Orders</span>
+          {activeView === "orders" && <span className="sidebar-indicator ml-auto h-1.5 w-1.5 rounded-full bg-cyan-300 shadow-[0_0_9px_2px_rgba(103,232,249,.65)]" />}
         </button>
 
         <div className="mt-auto pb-4">
           <div className="mb-3 h-px bg-white/[0.09]" />
           <div className="relative">
-            <button onClick={() => setComingSoonTip(comingSoonTip === "settings" ? "" : "settings")} aria-expanded={comingSoonTip === "settings"} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] text-indigo-100/75 transition hover:bg-white/[0.06] hover:text-white">
-              <Settings2 size={16} /> Settings
+            <button
+              title="Settings"
+              onClick={() =>
+                setComingSoonTip(comingSoonTip === "settings" ? "" : "settings")
+              }
+              aria-expanded={comingSoonTip === "settings"}
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] text-indigo-100/75 transition hover:bg-white/[0.06] hover:text-white"
+            >
+              <Settings2 size={16} />{" "}
+              <span className="sidebar-copy">Settings</span>
             </button>
-            {comingSoonTip === "settings" && <div role="tooltip" onMouseEnter={() => setComingSoonTipHovered(true)} onMouseLeave={() => setComingSoonTipHovered(false)} className="absolute bottom-0 left-full z-50 ml-3 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"><span className="font-bold text-indigo-700">First draft preview</span><br />Settings are being built and will be fully available soon.</div>}
+            {comingSoonTip === "settings" && (
+              <div
+                role="tooltip"
+                onMouseEnter={() => setComingSoonTipHovered(true)}
+                onMouseLeave={() => setComingSoonTipHovered(false)}
+                className="absolute bottom-0 left-full z-50 ml-3 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"
+              >
+                <span className="font-bold text-indigo-700">
+                  First draft preview
+                </span>
+                <br />
+                Settings are being built and will be fully available soon.
+              </div>
+            )}
           </div>
           <div className="relative">
-            <button onClick={() => setComingSoonTip(comingSoonTip === "help" ? "" : "help")} aria-expanded={comingSoonTip === "help"} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] text-indigo-100/75 transition hover:bg-white/[0.06] hover:text-white">
-              <CircleHelp size={16} /> Help & support
+            <button
+              title="Help & support"
+              onClick={() => { setComingSoonTip(""); setActiveView("help"); }}
+              aria-current={activeView === "help" ? "page" : undefined}
+              className={`${activeView === "help" ? "nav-active text-white" : "text-indigo-100/75 hover:bg-white/[0.06] hover:text-white"} flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] transition`}
+            >
+              <CircleHelp size={16} />{" "}
+              <span className="sidebar-copy">Help &amp; support</span>
             </button>
-            {comingSoonTip === "help" && <div role="tooltip" onMouseEnter={() => setComingSoonTipHovered(true)} onMouseLeave={() => setComingSoonTipHovered(false)} className="absolute bottom-0 left-full z-50 ml-3 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"><span className="font-bold text-indigo-700">First draft preview</span><br />Help & support are being built and will be fully available soon.</div>}
           </div>
           <button
             type="button"
@@ -430,63 +649,174 @@ export default function App() {
             ) : (
               <WifiOff size={15} />
             )}
-            {connection.status === "connected" ? "Connected · All systems ready" : "Disconnected"}
+            <span className="sidebar-copy">
+              {connection.status === "connected"
+                ? "Connected · All systems ready"
+                : "Disconnected"}
+            </span>
           </button>
           <div className="relative mt-2">
             <button
               type="button"
-              disabled={update.status === "checking" || update.status === "downloading"}
-              onClick={() => update.status === "downloaded" ? void window.desktop.installUpdate() : void checkUpdates()}
+              disabled={
+                update.status === "checking" || update.status === "downloading"
+              }
+              onClick={() =>
+                update.status === "downloaded"
+                  ? void window.desktop.installUpdate()
+                  : void checkUpdates()
+              }
               className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-[12px] font-semibold text-indigo-100/75 transition hover:bg-white/[0.06] hover:text-white disabled:cursor-wait disabled:opacity-60"
             >
-              <ArrowDownToLine size={15} className={update.status === "checking" || update.status === "downloading" ? "animate-bounce" : ""} />
-              {update.status === "downloaded" ? "Restart to update" : update.status === "checking" ? "Checking for updates…" : update.status === "downloading" ? "Downloading update…" : "Check Update"}
+              <ArrowDownToLine
+                size={15}
+                className={
+                  update.status === "checking" ||
+                  update.status === "downloading"
+                    ? "animate-bounce"
+                    : ""
+                }
+              />
+              <span className="sidebar-copy">
+                {update.status === "downloaded"
+                  ? "Restart to update"
+                  : update.status === "checking"
+                    ? "Checking for updates…"
+                    : update.status === "downloading"
+                      ? "Downloading update…"
+                      : "Check Update"}
+              </span>
             </button>
-            {(update.status === "available" || update.status === "downloading" || update.status === "downloaded") && (
-              <div role="status" className="absolute bottom-0 left-full z-50 ml-3 w-60 rounded-xl border border-indigo-100 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl">
-                <span className="font-bold text-indigo-700">{update.status === "downloaded" ? "Update ready" : update.status === "downloading" ? "Downloading update" : "Update available"}</span>
+            {(update.status === "available" ||
+              update.status === "downloading" ||
+              update.status === "downloaded") && (
+              <div
+                role="status"
+                className="absolute bottom-0 left-full z-50 ml-3 w-60 rounded-xl border border-indigo-100 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"
+              >
+                <span className="font-bold text-indigo-700">
+                  {update.status === "downloaded"
+                    ? "Update ready"
+                    : update.status === "downloading"
+                      ? "Downloading update"
+                      : "Update available"}
+                </span>
                 <br />
-                {update.status === "downloaded" ? "Click Restart to update to install it." : update.status === "downloading" ? `Downloading in the background${update.detail ? ` · ${update.detail}` : "…"}` : `Version ${update.detail ?? "newer"} is downloading in the background.`}
+                {update.status === "downloaded"
+                  ? "Click Restart to update to install it."
+                  : update.status === "downloading"
+                    ? `Downloading in the background${update.detail ? ` · ${update.detail}` : "…"}`
+                    : `Version ${update.detail ?? "newer"} is downloading in the background.`}
               </div>
             )}
           </div>
         </div>
       </aside>
 
-      <main className="ml-[250px] min-h-screen">
-        <header className="topbar sticky top-0 z-10 flex h-[70px] items-center justify-between px-9">
+      <main className="app-main ml-[250px] flex min-h-screen flex-col">
+        <header className="topbar sticky top-0 z-10 flex h-[70px] items-center justify-between px-2.5">
           <div className="flex items-center gap-2 text-[12px] font-medium text-slate-500">
-            <span>{activeView === "sales" ? "Reports" : "Workspace"}</span>
+            <span>{activeView === "overview" ? "Workspace" : "Reports"}</span>
             <span className="text-slate-300">/</span>
             <span className="text-slate-700">
-              {activeView === "sales" ? "Sales & collections" : "Overview"}
+              {activeView === "sales" ? "Sales & collections" : activeView === "daybook" ? "Day Book" : activeView === "orders" ? "Orders" : activeView === "help" ? "Help & Support" : "Overview"}
             </span>
           </div>
           <div className="flex items-center gap-2">
-            {selectedCompany && <div title={selectedCompany} className="mr-2 inline-flex max-w-[240px] items-center gap-2 truncate rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1.5 text-[12px] font-semibold text-indigo-800"><BookOpenText size={14} className="shrink-0" /><span className="truncate">{selectedCompany}</span></div>}
+            {selectedCompany && (
+              <div
+                title={selectedCompany}
+                className="mr-2 inline-flex max-w-[240px] items-center gap-2 truncate rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1.5 text-[12px] font-semibold text-indigo-800"
+              >
+                <BookOpenText size={14} className="shrink-0" />
+                <span className="truncate">{selectedCompany}</span>
+              </div>
+            )}
             <div className="relative">
-            <button aria-label="Search" aria-expanded={comingSoonTip === "search"} onClick={() => setComingSoonTip(comingSoonTip === "search" ? "" : "search")} className="top-icon">
-              <Search size={17} />
-            </button>
-            {comingSoonTip === "search" && <div role="tooltip" onMouseEnter={() => setComingSoonTipHovered(true)} onMouseLeave={() => setComingSoonTipHovered(false)} className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"><span className="font-bold text-indigo-700">First draft preview</span><br />Search is being built and will be fully available soon.</div>}
+              <button
+                aria-label="Search"
+                aria-expanded={comingSoonTip === "search"}
+                onClick={() =>
+                  setComingSoonTip(comingSoonTip === "search" ? "" : "search")
+                }
+                className="top-icon"
+              >
+                <Search size={17} />
+              </button>
+              {comingSoonTip === "search" && (
+                <div
+                  role="tooltip"
+                  onMouseEnter={() => setComingSoonTipHovered(true)}
+                  onMouseLeave={() => setComingSoonTipHovered(false)}
+                  className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"
+                >
+                  <span className="font-bold text-indigo-700">
+                    First draft preview
+                  </span>
+                  <br />
+                  Search is being built and will be fully available soon.
+                </div>
+              )}
             </div>
             <div className="relative">
-            <button aria-label="Notifications" aria-expanded={comingSoonTip === "notifications"} onClick={() => setComingSoonTip(comingSoonTip === "notifications" ? "" : "notifications")} className="top-icon relative">
-              <Bell size={17} />
-              <span className="absolute right-[8px] top-[7px] h-1.5 w-1.5 rounded-full bg-rose-400 ring-2 ring-white" />
-            </button>
-            {comingSoonTip === "notifications" && <div role="tooltip" onMouseEnter={() => setComingSoonTipHovered(true)} onMouseLeave={() => setComingSoonTipHovered(false)} className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"><span className="font-bold text-indigo-700">First draft preview</span><br />Notifications are being built and will be fully available soon.</div>}
+              <button
+                aria-label="Notifications"
+                aria-expanded={comingSoonTip === "notifications"}
+                onClick={() =>
+                  setComingSoonTip(
+                    comingSoonTip === "notifications" ? "" : "notifications",
+                  )
+                }
+                className="top-icon relative"
+              >
+                <Bell size={17} />
+                <span className="absolute right-[8px] top-[7px] h-1.5 w-1.5 rounded-full bg-rose-400 ring-2 ring-white" />
+              </button>
+              {comingSoonTip === "notifications" && (
+                <div
+                  role="tooltip"
+                  onMouseEnter={() => setComingSoonTipHovered(true)}
+                  onMouseLeave={() => setComingSoonTipHovered(false)}
+                  className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"
+                >
+                  <span className="font-bold text-indigo-700">
+                    First draft preview
+                  </span>
+                  <br />
+                  Notifications are being built and will be fully available
+                  soon.
+                </div>
+              )}
             </div>
             <div className="relative ml-2 border-l border-slate-200 pl-4">
-              <button onClick={() => setComingSoonTip(comingSoonTip === "brand" ? "" : "brand")} aria-expanded={comingSoonTip === "brand"} className="flex items-center gap-2.5 rounded-lg text-left">
-              <div className="avatar grid h-8 w-8 place-items-center rounded-full text-[12px] font-bold text-white">
-                TL
-              </div>
-              <div className="text-[12px] font-semibold text-slate-700">
-                TallyLink
-              </div>
+              <button
+                onClick={() =>
+                  setComingSoonTip(comingSoonTip === "brand" ? "" : "brand")
+                }
+                aria-expanded={comingSoonTip === "brand"}
+                className="flex items-center gap-2.5 rounded-lg text-left"
+              >
+                <div className="avatar grid h-8 w-8 place-items-center rounded-full text-[12px] font-bold text-white">
+                  TL
+                </div>
+                <div className="text-[12px] font-semibold text-slate-700">
+                  TallyLink
+                </div>
               </button>
-              {comingSoonTip === "brand" && <div role="tooltip" onMouseEnter={() => setComingSoonTipHovered(true)} onMouseLeave={() => setComingSoonTipHovered(false)} className="absolute right-0 top-full z-50 mt-2 w-60 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"><span className="font-bold text-indigo-700">First draft preview</span><br />TallyLink is taking shape. More features are coming soon.</div>}
+              {comingSoonTip === "brand" && (
+                <div
+                  role="tooltip"
+                  onMouseEnter={() => setComingSoonTipHovered(true)}
+                  onMouseLeave={() => setComingSoonTipHovered(false)}
+                  className="absolute right-0 top-full z-50 mt-2 w-60 rounded-xl border border-slate-200 bg-white p-3 text-[12px] leading-5 text-slate-700 shadow-xl"
+                >
+                  <span className="font-bold text-indigo-700">
+                    First draft preview
+                  </span>
+                  <br />
+                  TallyLink is taking shape. More features are coming soon.
+                </div>
+              )}
             </div>
             <button
               type="button"
@@ -500,194 +830,17 @@ export default function App() {
           </div>
         </header>
 
-        <div className="mx-auto max-w-[1320px] px-9 pb-10 pt-8">
+        <div className="mx-auto w-full max-w-[1320px] flex-1 px-2.5 pb-3 pt-2.5">
           {activeView === "overview" ? (
-            <>
-              <section className="hero-card relative overflow-hidden rounded-[26px] px-8 py-7 text-white shadow-xl shadow-indigo-200/50">
-                <div className="hero-orb hero-orb-one" />
-                <div className="hero-orb hero-orb-two" />
-                <div className="hero-content relative z-[1] flex items-center justify-between gap-8">
-                  <div className="max-w-[560px]">
-                    <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/10 px-3 py-1.5 text-[12px] font-semibold tracking-[0.12em] text-indigo-50">
-                      <Sparkles size={13} /> YOUR FINANCIAL OVERVIEW
-                    </div>
-                    <h1 className="text-[30px] font-bold leading-[1.15] tracking-[-0.045em]">
-                      Make your numbers
-                      <br />
-                      work harder for you.
-                    </h1>
-                    <p className="mt-3 max-w-[410px] text-[13px] leading-5 text-indigo-100/80">
-                      Bring Tally data into clear, flexible reports built around
-                      the way your business works.
-                    </p>
-                  </div>
-                  <div
-                    className="hero-visual hidden min-w-[260px] flex-1 justify-end md:flex"
-                    aria-hidden="true"
-                  >
-                    <div className="float-card chart-card relative w-[258px] rounded-2xl border border-white/20 bg-white/[0.14] p-4 shadow-2xl shadow-indigo-950/20 backdrop-blur-md">
-                      <div className="flex items-start justify-between">
-                        <div>
-                          <div className="text-[11px] font-medium text-indigo-100/80">
-                            BUSINESS SNAPSHOT
-                          </div>
-                          <div className="mt-1 text-[19px] font-bold tracking-tight">
-                            Looking clear
-                          </div>
-                        </div>
-                        <div className="grid h-8 w-8 place-items-center rounded-xl bg-emerald-300/20 text-emerald-200">
-                          <TrendingUp size={16} />
-                        </div>
-                      </div>
-                      <div className="mt-4 flex h-[80px] items-end gap-2 rounded-xl bg-indigo-950/15 px-3 pb-2 pt-3">
-                        {[32, 48, 38, 62, 52, 78, 67, 94, 76, 100, 86, 113].map(
-                          (height, index) => (
-                            <span
-                              key={index}
-                              className="chart-bar flex-1 rounded-t-[4px] bg-gradient-to-t from-cyan-300/45 to-white/90"
-                              style={{
-                                height: `${height * 0.62}px`,
-                                animationDelay: `${index * 55}ms`,
-                              }}
-                            />
-                          ),
-                        )}
-                      </div>
-                      <div className="mt-3 flex items-center justify-between text-[11px] text-indigo-100/75">
-                        <span>Reports designed around you</span>
-                        <span>✦</span>
-                      </div>
-                      <div className="floating-chip absolute -left-8 top-[82px] flex items-center gap-2 rounded-xl border border-white/30 bg-white px-3 py-2 text-[12px] font-semibold text-slate-700 shadow-xl">
-                        <span className="grid h-6 w-6 place-items-center rounded-lg bg-emerald-100 text-emerald-700">
-                          <Check size={13} />
-                        </span>{" "}
-                        Read-only & secure
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </section>
-
-              <section className="mt-7">
-                <div className="mb-3 flex items-end justify-between">
-                  <div>
-                    <div className="section-kicker">A GOOD PLACE TO BEGIN</div>
-                    <h2 className="mt-1 text-[17px] font-bold tracking-[-0.025em] text-slate-800">
-                      Reports made for your workflow
-                    </h2>
-                  </div>
-                  <button className="inline-flex items-center gap-1 text-[12px] font-semibold text-indigo-600 transition hover:gap-2">
-                    Explore ideas <ArrowUpRight size={13} />
-                  </button>
-                </div>
-                <div className="grid grid-cols-3 gap-3.5">
-                  {reportIdeas.map(
-                    ({ title, detail, icon: Icon, color, tag }, index) => (
-                      <button
-                        key={title}
-                        onClick={
-                          index === 0 ? () => void loadSalesReport() : undefined
-                        }
-                        className={`idea-card idea-${color} group relative overflow-hidden rounded-2xl border p-4 text-left transition duration-300 hover:-translate-y-1 hover:shadow-xl`}
-                        style={{ animationDelay: `${index * 100}ms` }}
-                      >
-                        <div className="flex items-start justify-between">
-                          <div className="idea-icon grid h-10 w-10 place-items-center rounded-[13px]">
-                            <Icon size={19} />
-                          </div>
-                          <span className="idea-tag rounded-full px-2 py-1 text-[10px] font-bold tracking-[0.1em]">
-                            {tag}
-                          </span>
-                        </div>
-                        <div className="mt-4 text-[13px] font-bold text-slate-800">
-                          {title}
-                        </div>
-                        <div className="mt-1 max-w-[220px] text-[12px] leading-[17px] text-slate-500">
-                          {detail}
-                        </div>
-                        <div className="idea-arrow absolute bottom-4 right-4 grid h-7 w-7 translate-y-1 place-items-center rounded-full opacity-0 transition duration-200 group-hover:translate-y-0 group-hover:opacity-100">
-                          <ArrowRight size={14} />
-                        </div>
-                      </button>
-                    ),
-                  )}
-                </div>
-              </section>
-
-              <section className="setup-panel mt-5 grid min-h-[220px] grid-cols-[1.15fr_.85fr] overflow-hidden rounded-[22px] border border-white bg-white shadow-[0_10px_35px_rgba(40,56,110,.07)]">
-                <div className="flex flex-col items-start justify-center px-7 py-6">
-                  <div className="inline-flex items-center gap-1.5 rounded-full bg-violet-50 px-2.5 py-1 text-[11px] font-bold tracking-[0.08em] text-violet-700">
-                    <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />{" "}
-                    STEP 1 · GET CONNECTED
-                  </div>
-                  <h2 className="mt-3 text-[18px] font-bold tracking-[-0.03em] text-slate-800">
-                    Your reports start with a connection
-                  </h2>
-                  <p className="mt-1.5 max-w-[420px] text-[12px] leading-[18px] text-slate-500">
-                    Use the connection status badge in the sidebar to connect
-                    Tally ERP or TallyPrime. Your accounting data stays
-                    untouched.
-                  </p>
-                </div>
-                <div className="setup-art relative flex items-center justify-center overflow-hidden">
-                  <div className="art-glow" />
-                  <div className="art-ring art-ring-one" />
-                  <div className="art-ring art-ring-two" />
-                  <div className="report-preview relative z-[1] w-[225px] rounded-2xl border border-white/80 bg-white/90 p-3.5 shadow-xl shadow-indigo-200/50 backdrop-blur">
-                    <div className="flex items-center gap-2">
-                      <div className="grid h-7 w-7 place-items-center rounded-lg bg-indigo-100 text-indigo-600">
-                        <FileText size={14} />
-                      </div>
-                      <div>
-                        <div className="text-[11px] font-bold text-slate-700">
-                          Sales & collections
-                        </div>
-                        <div className="text-[10px] text-slate-500">
-                          Custom report preview
-                        </div>
-                      </div>
-                      <div className="ml-auto grid h-6 w-6 place-items-center rounded-full bg-violet-50 text-violet-600">
-                        <Sparkles size={11} />
-                      </div>
-                    </div>
-                    <div className="mt-3 space-y-2 rounded-xl bg-slate-50 p-2.5">
-                      <div className="grid grid-cols-3 text-[10px] font-bold uppercase tracking-wide text-slate-500">
-                        <span>Invoice</span>
-                        <span>Received</span>
-                        <span>Balance</span>
-                      </div>
-                      <div className="h-px bg-slate-200" />
-                      <div className="flex items-center justify-between text-[10px] text-slate-600">
-                        <span className="flex items-center gap-1.5">
-                          <span className="h-1.5 w-1.5 rounded-full bg-violet-400" />
-                          INV-1042
-                        </span>
-                        <span>₹ 24,000</span>
-                        <span>₹ 0</span>
-                      </div>
-                      <div className="flex items-center justify-between text-[10px] text-slate-600">
-                        <span className="flex items-center gap-1.5">
-                          <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-                          INV-1043
-                        </span>
-                        <span>₹ 12,500</span>
-                        <span>₹ 7,500</span>
-                      </div>
-                    </div>
-                    <div className="mt-2.5 flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
-                      <ShieldCheck size={11} /> Data stays read-only
-                    </div>
-                  </div>
-                  <div className="art-sticker absolute right-[12%] top-[18%] grid h-9 w-9 place-items-center rounded-xl bg-amber-300 text-amber-950 shadow-lg">
-                    <WalletCards size={17} />
-                  </div>
-                  <div className="art-sticker art-sticker-two absolute bottom-[17%] left-[12%] grid h-8 w-8 place-items-center rounded-xl bg-cyan-300 text-cyan-950 shadow-lg">
-                    <Check size={15} />
-                  </div>
-                </div>
-              </section>
-            </>
-          ) : (
+            <DashboardSummary
+              company={selectedCompany}
+              port={connection.port ?? Number(tallyPort)}
+              connected={connection.status === "connected"}
+              onOpenSales={() => void loadSalesReport()}
+              onOpenDayBook={() => void loadDayBook()}
+              onOpenOrders={() => setActiveView("orders")}
+            />
+          ) : activeView === "sales" ? (
             <section className="report-screen animate-[rise-in_.4s_ease-out_both]">
               <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
                 <div className="min-w-0 flex-1">
@@ -699,46 +852,43 @@ export default function App() {
                       <ArrowRight className="rotate-180" size={14} /> Overview
                     </button>
                     <span className="section-kicker">CUSTOM REPORT</span>
-                  </div>
-                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
                     <h1 className="text-[22px] font-bold tracking-[-0.035em] text-slate-900">
                       Sales & collections
                     </h1>
-                    <p className="text-[14px] text-slate-600">
-                      Invoice sales, allocated receipts & balances
-                    </p>
                   </div>
                 </div>
-                <div className="flex flex-wrap items-end gap-1.5 rounded-xl border border-slate-200 bg-white p-2 shadow-sm">
-                  <label className="grid gap-0.5 text-[11px] font-bold uppercase tracking-wide text-slate-600">
-                    From
-                    <input
-                      type="date"
-                      value={reportFrom}
-                      max={reportTo}
-                      onChange={(event) => setReportFrom(event.target.value)}
-                      className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[13px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400"
-                    />
-                  </label>
-                  <label className="grid gap-0.5 text-[11px] font-bold uppercase tracking-wide text-slate-600">
-                    To
-                    <input
-                      type="date"
-                      value={reportTo}
-                      min={reportFrom}
-                      max={todayIso}
-                      onChange={(event) => setReportTo(event.target.value)}
-                      className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[13px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400"
-                    />
-                  </label>
-                  <button
-                    disabled={reportStatus === "loading"}
-                    onClick={() => void loadSalesReport()}
-                    className="connect-action inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-[13px] font-bold text-white transition hover:-translate-y-0.5 disabled:opacity-60"
-                  >
-                    <ArrowDownToLine size={15} /> Refresh
-                  </button>
-                </div>
+                {(!selectedParty || reportStatus !== "loaded") && (
+                  <div className="flex flex-wrap items-end gap-1.5 rounded-xl border border-slate-200 bg-white p-2 shadow-sm">
+                    <label className="grid gap-0.5 text-[11px] font-bold uppercase tracking-wide text-slate-600">
+                      From
+                      <input
+                        type="date"
+                        value={reportFrom}
+                        max={reportTo}
+                        onChange={(event) => setReportFrom(event.target.value)}
+                        className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[13px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400"
+                      />
+                    </label>
+                    <label className="grid gap-0.5 text-[11px] font-bold uppercase tracking-wide text-slate-600">
+                      To
+                      <input
+                        type="date"
+                        value={reportTo}
+                        min={reportFrom}
+                        max={todayIso}
+                        onChange={(event) => setReportTo(event.target.value)}
+                        className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[13px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400"
+                      />
+                    </label>
+                    <button
+                      disabled={reportStatus === "loading"}
+                      onClick={() => void loadSalesReport()}
+                      className="connect-action inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-[13px] font-bold text-white transition hover:-translate-y-0.5 disabled:opacity-60"
+                    >
+                      <ArrowDownToLine size={15} /> Refresh
+                    </button>
+                  </div>
+                )}
               </div>
 
               {reportStatus === "error" && (
@@ -755,25 +905,63 @@ export default function App() {
               )}
 
               {reportStatus === "loading" && (
-                <div className="mt-4 overflow-hidden rounded-2xl border border-indigo-100 bg-white shadow-[0_12px_35px_rgba(40,56,110,.08)]" role="status" aria-live="polite">
+                <div
+                  className="mt-4 overflow-hidden rounded-2xl border border-indigo-100 bg-white shadow-[0_12px_35px_rgba(40,56,110,.08)]"
+                  role="status"
+                  aria-live="polite"
+                >
                   <div className="flex items-center gap-3 border-b border-indigo-50 bg-gradient-to-r from-indigo-50 via-white to-violet-50 px-5 py-4">
                     <span className="relative grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-white text-indigo-600 shadow-sm">
                       <span className="absolute inset-0 animate-ping rounded-xl bg-indigo-200/50" />
                       <TrendingUp className="relative" size={19} />
                     </span>
                     <div>
-                      <div className="text-[14px] font-bold text-slate-900">Loading Sales & collections</div>
-                      <div className="mt-0.5 text-[12px] text-slate-600">Reading invoices and receipt allocations from Tally…</div>
+                      <div className="text-[14px] font-bold text-slate-900">
+                        Loading Sales & collections
+                      </div>
+                      <div className="mt-0.5 text-[12px] text-slate-600">
+                        Reading the requested records from Tally…
+                      </div>
                     </div>
                     <span className="ml-auto h-5 w-5 animate-spin rounded-full border-2 border-indigo-100 border-t-indigo-600" />
                   </div>
                   <div className="space-y-3 p-5">
                     <div className="grid grid-cols-6 gap-3">
-                      {["w-2/3", "w-3/4", "w-1/2", "w-2/3", "w-1/2", "w-1/2"].map((width, index) => <div key={index} className={`h-3 ${width} animate-pulse rounded-full bg-slate-100`} />)}
+                      {[
+                        "w-2/3",
+                        "w-3/4",
+                        "w-1/2",
+                        "w-2/3",
+                        "w-1/2",
+                        "w-1/2",
+                      ].map((width, index) => (
+                        <div
+                          key={index}
+                          className={`h-3 ${width} animate-pulse rounded-full bg-slate-100`}
+                        />
+                      ))}
                     </div>
                     {Array.from({ length: 6 }, (_, index) => (
-                      <div key={index} className="grid grid-cols-6 items-center gap-3 border-t border-slate-50 pt-3">
-                        {["w-3/4", "w-1/2", "w-2/3", "w-1/2", "w-2/3", "w-1/3"].map((width, cell) => <div key={cell} className={`h-3 ${width} animate-pulse rounded-full bg-slate-100`} style={{ animationDelay: `${(index * 6 + cell) * 45}ms` }} />)}
+                      <div
+                        key={index}
+                        className="grid grid-cols-6 items-center gap-3 border-t border-slate-50 pt-3"
+                      >
+                        {[
+                          "w-3/4",
+                          "w-1/2",
+                          "w-2/3",
+                          "w-1/2",
+                          "w-2/3",
+                          "w-1/3",
+                        ].map((width, cell) => (
+                          <div
+                            key={cell}
+                            className={`h-3 ${width} animate-pulse rounded-full bg-slate-100`}
+                            style={{
+                              animationDelay: `${(index * 6 + cell) * 45}ms`,
+                            }}
+                          />
+                        ))}
                       </div>
                     ))}
                   </div>
@@ -781,7 +969,7 @@ export default function App() {
               )}
 
               {reportStatus === "loaded" && (
-                <div className="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[300px_minmax(0,1fr)]">
+                <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-[240px_minmax(0,1fr)] xl:grid-cols-[340px_minmax(0,1fr)]">
                   <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
                     <div className="border-b border-slate-100 bg-gradient-to-r from-indigo-50 to-white px-4 pb-4 pt-5">
                       <div className="flex items-center justify-between">
@@ -809,23 +997,25 @@ export default function App() {
                         />
                       </div>
                     </div>
-                    <div className="max-h-[620px] overflow-y-auto p-2">
+                    <div className="max-h-[70vh] overflow-y-auto p-2">
                       {visiblePartyLedgers.map((ledger) => (
                         <button
                           key={ledger.name}
-                          onClick={() => setSelectedParty(ledger.name)}
+                          onClick={() => {
+                            void selectPartyLedger(ledger.name);
+                          }}
                           className={`party-ledger-row mb-1 w-full rounded-xl border px-3 py-2.5 text-left transition ${selectedParty === ledger.name ? "party-ledger-selected border-indigo-200 bg-indigo-50" : "border-transparent hover:border-slate-100 hover:bg-slate-50"}`}
                         >
-                          <div className="truncate text-[14px] font-bold text-slate-900">
-                            {ledger.name}
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate text-[14px] font-bold text-slate-900">
+                              {ledger.name}
+                            </span>
+                            <span className="ml-auto shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
+                              {ledger.invoices.toLocaleString("en-IN")} inv.
+                            </span>
                           </div>
-                          <div className="mt-1.5 flex items-center justify-between gap-2 text-[12px] text-slate-600">
-                            <span>
-                              {ledger.invoices.toLocaleString("en-IN")} invoices
-                            </span>
-                            <span className="truncate font-semibold text-amber-800">
-                              Due {formatMoney.format(ledger.balance)}
-                            </span>
+                          <div className="mt-1 text-[12px] font-semibold text-amber-800">
+                            Bill-wise due {formatMoney.format(ledger.balance)}
                           </div>
                         </button>
                       ))}
@@ -847,123 +1037,58 @@ export default function App() {
                       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                         <div className="metric-card rounded-xl border border-violet-100 bg-gradient-to-br from-white to-violet-50 p-3">
                           <div className="text-[13px] font-semibold text-slate-600">
-                            Sales invoices
+                            {showSettledInvoices ? "Sales / debit" : "Open receivables"}
                           </div>
                           <div className="mt-1 text-[19px] font-bold tracking-tight text-violet-800">
                             {formatMoney.format(reportTotals.sales)}
                           </div>
                           <div className="mt-0.5 text-[12px] font-medium text-violet-900">
-                            Total Invoices:{" "}
+                            {showSettledInvoices ? "Ledger entries: " : "Total invoices: "}{" "}
                             {filteredReportRows.length.toLocaleString("en-IN")}
                           </div>
                         </div>
                         <div className="metric-card rounded-xl border border-emerald-100 bg-gradient-to-br from-white to-emerald-50 p-3">
                           <div className="text-[13px] font-semibold text-slate-600">
-                            Allocated receipts
+                            {showSettledInvoices ? "Received / credit" : "Open bills"}
                           </div>
                           <div className="mt-1 truncate text-[19px] font-bold tracking-tight text-emerald-900">
-                            {formatMoney.format(reportTotals.received)}
+                            {showSettledInvoices ? formatMoney.format(reportTotals.received) : filteredReportRows.length.toLocaleString("en-IN")}
                           </div>
                           <div className="mt-0.5 text-[12px] text-emerald-800">
-                            Against this ledger
+                            {showSettledInvoices ? "All credit entries" : "Outstanding bill-wise"}
                           </div>
                         </div>
                         <div className="metric-card rounded-xl border border-amber-100 bg-gradient-to-br from-white to-amber-50 p-3">
                           <div className="text-[13px] font-semibold text-slate-600">
-                            Outstanding balance
+                            {showSettledInvoices ? "Net debit movement" : "Outstanding balance"}
                           </div>
                           <div className="mt-1 truncate text-[19px] font-bold tracking-tight text-amber-900">
                             {formatMoney.format(reportTotals.balance)}
                           </div>
                           <div className="mt-0.5 text-[12px] text-amber-800">
-                            Closing amount due
+                            {showSettledInvoices ? "Period debits less credits" : "Closing amount due"}
                           </div>
                         </div>
                       </div>
-                      <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-4">
-                          <div className="min-w-0">
-                            <div className="text-[12px] font-bold uppercase tracking-[0.1em] text-slate-600">
-                              Party ledger
-                            </div>
-                            <h2 className="mt-1 truncate text-[18px] font-bold text-slate-950">
-                              {selectedParty}
-                            </h2>
-                          </div>
-                          <div className="rounded-lg bg-indigo-50 px-3 py-2 text-[12px] font-semibold text-indigo-800">
-                            {formatReportDate(reportFrom)} —{" "}
-                            {formatReportDate(reportTo)}
-                          </div>
-                        </div>
-                        <div className="max-h-[560px] overflow-auto">
-                          <table className="min-w-[760px] w-full border-collapse text-left">
-                            <thead className="sticky top-0 z-[1] bg-slate-50 text-[12px] font-bold uppercase tracking-[0.06em] text-slate-600">
-                              <tr>
-                                <th className="px-4 py-3.5">Date</th>
-                                <th className="px-3 py-3.5">Particulars</th>
-                                <th className="px-3 py-3.5">Voucher no.</th>
-                                <th className="px-3 py-3.5 text-right">
-                                  Sales
-                                </th>
-                                <th className="px-3 py-3.5 text-right">
-                                  Received
-                                </th>
-                                <th className="px-4 py-3.5 text-right">
-                                  Balance
-                                </th>
-                                <th className="px-4 py-3.5 text-right">Days passed</th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-100 text-[14px]">
-                              {filteredReportRows.map((row, index) => (
-                                <tr
-                                  key={`${row.number}-${row.date}-${index}`}
-                                  className="transition hover:bg-indigo-50/45"
-                                >
-                                  <td className="whitespace-nowrap px-4 py-4 text-slate-700">
-                                    {formatReportDate(row.date)}
-                                  </td>
-                                  <td className="px-3 py-4">
-                                    <span className="rounded-md bg-violet-50 px-2.5 py-1.5 text-[12px] font-bold text-violet-800">
-                                      Sales invoice
-                                    </span>
-                                  </td>
-                                  <td className="whitespace-nowrap px-3 py-4 font-bold text-slate-900">
-                                    {row.number || "—"}
-                                  </td>
-                                  <td className="whitespace-nowrap px-3 py-4 text-right font-semibold tabular-nums text-slate-900">
-                                    {formatMoney.format(row.amount)}
-                                  </td>
-                                  <td className="whitespace-nowrap px-3 py-4 text-right font-semibold tabular-nums text-emerald-800">
-                                    {formatMoney.format(row.received)}
-                                  </td>
-                                  <td className="whitespace-nowrap px-4 py-4 text-right font-bold tabular-nums text-slate-950">
-                                    {formatMoney.format(row.balance)}
-                                  </td>
-                                  <td className="whitespace-nowrap px-4 py-4 text-right font-semibold tabular-nums text-slate-600">
-                                    {daysSince(row.date)}
-                                  </td>
-                                </tr>
-                              ))}
-                              {filteredReportRows.length === 0 && (
-                                <tr>
-                                  <td
-                                    colSpan={7}
-                                    className="px-5 py-16 text-center"
-                                  >
-                                    <div className="text-[15px] font-semibold text-slate-800">
-                                      No invoices for this party
-                                    </div>
-                                    <div className="mt-1 text-[13px] text-slate-600">
-                                      Choose another date range or party ledger.
-                                    </div>
-                                  </td>
-                                </tr>
-                              )}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
+                      <SalesInvoiceTable
+                        key={`${selectedParty}-${showSettledInvoices}`}
+                        rows={tableRows}
+                        fromDate={reportFrom}
+                        toDate={reportTo}
+                        party={selectedParty}
+                        maxDate={todayIso}
+                        onFromDateChange={setReportFrom}
+                        onToDateChange={setReportTo}
+                        onRefresh={() => void loadSalesReport()}
+                        showSettled={showSettledInvoices}
+                        settledCount={selectedParty ? (showSettledInvoices ? partyVoucherRows.length : 0) : 0}
+                        onToggleSettled={() => void toggleSettledView()}
+                        isLoading={partyVouchersLoading || ledgerDetailLoading}
+                        loadError={partyVoucherError || ledgerDetailError}
+                          emptyMessage={showSettledInvoices
+                            ? "No debit or credit ledger entries for this party in the selected date range."
+                            : "No open receivables for this party."}
+                      />
                     </section>
                   ) : (
                     <section className="grid min-h-[320px] place-items-center rounded-2xl border border-dashed border-indigo-200 bg-white/75 p-8 text-center">
@@ -975,8 +1100,7 @@ export default function App() {
                           Choose a party ledger
                         </h2>
                         <p className="mt-1 max-w-[300px] text-[14px] leading-6 text-slate-600">
-                          Search the list and select a customer to open their
-                          sales ledger with allocated receipts and balance.
+                          Search the list and select a party to view open receivables or its dated debit and credit ledger entries.
                         </p>
                       </div>
                     </section>
@@ -1006,9 +1130,62 @@ export default function App() {
                 </div>
               )}
             </section>
+          ) : activeView === "orders" ? (
+            <OrdersModule key={selectedCompany} company={selectedCompany} port={connection.port ?? Number(tallyPort)} />
+          ) : activeView === "help" ? (
+            <HelpGuide port={connection.port ?? Number(tallyPort)} onOpenConnect={() => setConnectOpen(true)} />
+          ) : (
+            <section className="report-screen">
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <div className="section-kicker">TALLY REPORT</div>
+                  <h1 className="mt-1 text-[22px] font-bold tracking-[-0.035em] text-slate-900">
+                    Day Book
+                  </h1>
+                  <p className="mt-1 text-[12px] text-slate-600">
+                    Sales and payments for the selected dates.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-end gap-2 rounded-xl border border-slate-200 bg-white p-2 shadow-sm">
+                  <label className="grid gap-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                    From
+                    <input type="date" value={dayBookFrom} max={dayBookTo} onChange={(event) => setDayBookFrom(event.target.value)} className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[12px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400" />
+                  </label>
+                  <label className="grid gap-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                    To
+                    <input type="date" value={dayBookTo} min={dayBookFrom} max={todayIso} onChange={(event) => setDayBookTo(event.target.value)} className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[12px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400" />
+                  </label>
+                  <button type="button" disabled={dayBookStatus === "loading"} onClick={() => void loadDayBook()} className="connect-action inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-[12px] font-bold text-white disabled:opacity-60">
+                    <ArrowDownToLine size={14} /> Refresh
+                  </button>
+                </div>
+              </div>
+              {dayBookStatus === "error" && (
+                <div className="mt-4 flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 p-4 text-[13px] text-rose-900">
+                  <AlertCircle size={17} className="mt-0.5 shrink-0" />
+                  <div><div className="font-bold">Couldn’t load the Day Book</div><div>{dayBookError}</div></div>
+                </div>
+              )}
+              {dayBookStatus === "loading" && (
+                <div role="status" className="mt-4 rounded-xl border border-indigo-100 bg-white p-5 text-[13px] text-slate-600">
+                  <span className="mr-2 inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-indigo-100 border-t-indigo-600 align-[-2px]" />
+                  Loading sales and payments from Tally…
+                </div>
+              )}
+              {dayBookStatus === "loaded" && (
+                <DayBookTable key={`${selectedCompany}-${dayBookFrom}-${dayBookTo}`} sales={dayBookSales} payments={dayBookPayments} />
+              )}
+              {dayBookStatus === "idle" && (
+                <div className="mt-5 rounded-xl border border-slate-200 bg-white p-8 text-center">
+                  <div className="font-semibold text-slate-800">Load sales and payments from Tally</div>
+                  <button type="button" onClick={() => void loadDayBook()} className="connect-action mt-3 rounded-lg px-4 py-2 text-[12px] font-bold text-white">Load Day Book</button>
+                </div>
+              )}
+            </section>
           )}
 
-          <footer className="mt-5 flex items-center justify-between rounded-xl border border-white/80 bg-white/75 px-4 py-3 text-[13px] text-slate-600 shadow-sm">
+        </div>
+          <footer className="mx-auto mt-auto flex w-full max-w-[1320px] items-center justify-between border-t border-slate-200/80 bg-white/70 px-5 py-3 text-[12px] text-slate-600">
             <div className="flex items-center gap-2">
               <ShieldCheck size={13} className="text-emerald-600" />
               <span className="font-semibold text-slate-600">
@@ -1022,7 +1199,6 @@ export default function App() {
               <span className="font-bold text-indigo-800">90283 60408</span>
             </div>
           </footer>
-        </div>
       </main>
 
       {connectOpen && (

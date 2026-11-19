@@ -7,7 +7,29 @@ contextBridge.exposeInMainWorld("desktop", {
     port: number;
     fromDate: string;
     toDate: string;
+    mode?: "receivables" | "ledger-outstandings" | "party-vouchers" | "party-ledger-movements";
+    party?: string;
   }) => ipcRenderer.invoke("tally:fetch-sales-report", input),
+  fetchDayBook: (input: {
+    company: string;
+    port: number;
+    fromDate: string;
+    toDate: string;
+  }) => ipcRenderer.invoke("tally:fetch-day-book", input),
+  fetchDashboardSummary: (input: { company: string; port: number; date: string }) =>
+    ipcRenderer.invoke("tally:fetch-dashboard-summary", input),
+  fetchOrders: (input: {
+    company: string;
+    port: number;
+    party: string;
+    kind: "sales" | "purchase";
+  }) => ipcRenderer.invoke("tally:fetch-orders", input),
+  fetchOrderParties: (input: {
+    company: string;
+    port: number;
+    kind: "sales" | "purchase";
+    status: "open" | "closed" | "all";
+  }) => ipcRenderer.invoke("tally:fetch-order-parties", input),
   checkForUpdates: () => ipcRenderer.invoke("updater:check"),
   installUpdate: () => ipcRenderer.invoke("updater:install"),
   onUpdateStatus: (
