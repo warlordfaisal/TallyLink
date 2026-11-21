@@ -15,7 +15,7 @@ function createWindow() {
     minWidth: 980,
     minHeight: 680,
     backgroundColor: "#f8fafc",
-    title: "TallyLink",
+    title: `TallyLink v${app.getVersion()}`,
     webPreferences: {
       preload: join(__dirname, "../preload/index.js"),
       contextIsolation: true,
@@ -212,6 +212,33 @@ function parseSignedTallyAmount(value: string) {
   if (!match) return null;
   const amount = Number(match[0]);
   return Number.isFinite(amount) ? amount : null;
+}
+
+function parseTallyQuantityParts(value: string) {
+  const parsePart = (part: string) => {
+    const normalized = part.replace(/,/g, "").trim();
+    const match = normalized.match(/-?\d+(?:\.\d+)?/);
+    if (!match || match.index === undefined) return null;
+    const quantity = Number(match[0]);
+    return Number.isFinite(quantity)
+      ? { quantity, unit: normalized.slice(match.index + match[0].length).trim() }
+      : null;
+  };
+  const [primaryRaw, alternateRaw] = value.split("=", 2);
+  const primary = parsePart(primaryRaw);
+  if (!primary) return null;
+  return { ...primary, alternate: alternateRaw ? parsePart(alternateRaw) : null };
+}
+
+function formatTallyQuantityLike(template: string, quantity: number) {
+  const parts = parseTallyQuantityParts(template);
+  if (!parts) return String(quantity);
+  const rounded = (value: number) => String(Math.round(value * 1000) / 1000);
+  let result = `${rounded(quantity)}${parts.unit ? ` ${parts.unit}` : ""}`;
+  if (parts.alternate && parts.quantity !== 0) {
+    result += ` = ${rounded(quantity * parts.alternate.quantity / parts.quantity)}${parts.alternate.unit ? ` ${parts.alternate.unit}` : ""}`;
+  }
+  return result;
 }
 
 function normalizeTallyDate(value: string) {
@@ -911,9 +938,10 @@ ipcMain.handle("tally:fetch-order-parties", async (_event, input: unknown) => {
   if (!company) return { ok: false, error: "Choose a Tally company first." };
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: "The Tally port is invalid." };
   const typeName = kind === "sales" ? "Sales Order" : "Purchase Order";
+  const voucherType = kind === "sales" ? "SalesOrder" : "PurcOrder";
   const collection = kind === "sales" ? "TallyLinkSalesOrderPartyChoices" : "TallyLinkPurchaseOrderPartyChoices";
   const requestXml = `<?xml version="1.0" encoding="UTF-8"?>
-<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>${collection}</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY TYPE="String">${escapeXml(company)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="${collection}" ISMODIFY="No"><TYPE>Vouchers : VoucherType</TYPE><FILTERS>OrderTypeFilter</FILTERS><NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD><NATIVEMETHOD>PartyLedgerName</NATIVEMETHOD><NATIVEMETHOD>IsPreClosed</NATIVEMETHOD><NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD></COLLECTION><SYSTEM TYPE="Formulae" NAME="OrderTypeFilter">$VoucherTypeName = "${typeName}"</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>${collection}</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY TYPE="String">${escapeXml(company)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="${collection}" ISMODIFY="No"><TYPE>Vouchers : VoucherType</TYPE><CHILDOF>$$VchType${voucherType}</CHILDOF><NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD><NATIVEMETHOD>PartyLedgerName</NATIVEMETHOD><NATIVEMETHOD>IsPreClosed</NATIVEMETHOD><NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
   try {
     const response = await fetch(`http://127.0.0.1:${port}`, { method: "POST", headers: { "Content-Type": "text/xml; charset=utf-8" }, body: requestXml, signal: AbortSignal.timeout(60000) });
     const xml = await response.text();
@@ -923,6 +951,7 @@ ipcMain.handle("tally:fetch-order-parties", async (_event, input: unknown) => {
     if ((tallyStatus && tallyStatus !== "1") || lineError) throw new Error(lineError || "Tally could not return order parties.");
     const parties = new Set<string>();
     for (const voucher of getXmlBlocks(xml, "VOUCHER")) {
+      if (decodeXmlText(getXmlTag(voucher, "VOUCHERTYPENAME")).trim().toLocaleLowerCase() !== typeName.toLocaleLowerCase()) continue;
       const party = decodeXmlText(getXmlTag(voucher, "PARTYLEDGERNAME")).trim();
       if (!party) continue;
       const preClosed = getXmlTag(voucher, "ISPRECLOSED").toLowerCase() === "yes";
@@ -949,14 +978,14 @@ ipcMain.handle("tally:fetch-orders", async (_event, input: unknown) => {
   const port = Number(request?.port ?? 9000);
   const kind = request?.kind === "purchase" ? "purchase" : "sales";
   if (!company) return { ok: false, error: "Choose a Tally company first." };
-  if (!party) return { ok: false, error: "Enter a party ledger before loading orders." };
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     return { ok: false, error: "The Tally port is invalid." };
 
   const typeName = kind === "sales" ? "Sales Order" : "Purchase Order";
+  const voucherType = kind === "sales" ? "SalesOrder" : "PurcOrder";
   const collection = kind === "sales" ? "TallyLinkPartySalesOrders" : "TallyLinkPartyPurchaseOrders";
   const requestXml = `<?xml version="1.0" encoding="UTF-8"?>
-<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>${collection}</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY TYPE="String">${escapeXml(company)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="${collection}" ISMODIFY="No"><TYPE>Vouchers : VoucherType</TYPE><FILTERS>PartyOrderFilter</FILTERS><NATIVEMETHOD>Date</NATIVEMETHOD><NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD><NATIVEMETHOD>VoucherNumber</NATIVEMETHOD><NATIVEMETHOD>Reference</NATIVEMETHOD><NATIVEMETHOD>PartyLedgerName</NATIVEMETHOD><NATIVEMETHOD>IsPreClosed</NATIVEMETHOD><NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD></COLLECTION><SYSTEM TYPE="Formulae" NAME="PartyOrderFilter">$PartyLedgerName = "${escapeXml(party)}" AND $VoucherTypeName = "${typeName}"</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>${collection}</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY TYPE="String">${escapeXml(company)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="${collection}" ISMODIFY="No"><TYPE>Vouchers : VoucherType</TYPE><CHILDOF>$$VchType${voucherType}</CHILDOF><NATIVEMETHOD>Date</NATIVEMETHOD><NATIVEMETHOD>MasterID</NATIVEMETHOD><NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD><NATIVEMETHOD>VoucherNumber</NATIVEMETHOD><NATIVEMETHOD>Reference</NATIVEMETHOD><NATIVEMETHOD>PartyLedgerName</NATIVEMETHOD><NATIVEMETHOD>IsPreClosed</NATIVEMETHOD><NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
   try {
     const response = await fetch(`http://127.0.0.1:${port}`, {
       method: "POST", headers: { "Content-Type": "text/xml; charset=utf-8" },
@@ -967,21 +996,69 @@ ipcMain.handle("tally:fetch-orders", async (_event, input: unknown) => {
     const status = getXmlTag(xml, "STATUS");
     const lineError = decodeXmlText(getXmlTag(xml, "LINEERROR"));
     if ((status && status !== "1") || lineError) throw new Error(lineError || "Tally could not return order data.");
-    const rows = getXmlBlocks(xml, "VOUCHER").map((voucher) => {
+    const orderVouchers = getXmlBlocks(xml, "VOUCHER").filter((voucher) =>
+      decodeXmlText(getXmlTag(voucher, "VOUCHERTYPENAME")).trim().toLocaleLowerCase() === typeName.toLocaleLowerCase()
+      && (!party || decodeXmlText(getXmlTag(voucher, "PARTYLEDGERNAME")).trim().toLocaleLowerCase() === party.toLocaleLowerCase())
+    );
+    const orderIds = new Set(orderVouchers.flatMap((voucher) =>
+      [...getXmlBlocks(voucher, "ALLINVENTORYENTRIES.LIST"), ...getXmlBlocks(voucher, "INVENTORYENTRIES.LIST")]
+        .map((entry) => getXmlTag(entry, "ORDERID").trim()),
+    ).filter(Boolean));
+    const orderDates = orderVouchers.map((voucher) => normalizeTallyDate(getXmlTag(voucher, "DATE"))).filter(Boolean).sort();
+    const fulfillmentVoucherTypes = kind === "sales"
+      ? [{ name: "Sales", formula: "Sales" }, { name: "DeliveryNote", formula: "DeliveryNote" }]
+      : [{ name: "Purchase", formula: "Purchase" }, { name: "ReceiptNote", formula: "ReceiptNote" }];
+    const fulfilledByOrderItem = new Map<string, number>();
+    if (orderIds.size) {
+      const fulfillmentResponses = await Promise.all(fulfillmentVoucherTypes.map(async ({ name, formula }) => {
+        const fulfillmentCollection = `${collection}${name}`;
+        const fulfillmentRequest = `<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>${fulfillmentCollection}</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${orderDates.length ? `<SVFROMDATE TYPE="Date">${orderDates[0].replace(/-/g, "")}</SVFROMDATE>` : ""}<SVCURRENTCOMPANY TYPE="String">${escapeXml(company)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="${fulfillmentCollection}" ISMODIFY="No"><TYPE>Vouchers : VoucherType</TYPE><CHILDOF>$$VchType${formula}</CHILDOF><NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD><NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+        const fulfillmentResponse = await fetch(`http://127.0.0.1:${port}`, {
+          method: "POST", headers: { "Content-Type": "text/xml; charset=utf-8" },
+          body: fulfillmentRequest, signal: AbortSignal.timeout(60000),
+        });
+        const fulfillmentXml = await fulfillmentResponse.text();
+        if (!fulfillmentResponse.ok) throw new Error(`Tally responded with HTTP ${fulfillmentResponse.status}.`);
+        const fulfillmentStatus = getXmlTag(fulfillmentXml, "STATUS");
+        const fulfillmentError = decodeXmlText(getXmlTag(fulfillmentXml, "LINEERROR"));
+        if ((fulfillmentStatus && fulfillmentStatus !== "1") || fulfillmentError) throw new Error(fulfillmentError || "Tally could not return linked order quantities.");
+        return fulfillmentXml;
+      }));
+      for (const fulfillmentXml of fulfillmentResponses) {
+        for (const voucher of getXmlBlocks(fulfillmentXml, "VOUCHER")) {
+          for (const entry of [...getXmlBlocks(voucher, "ALLINVENTORYENTRIES.LIST"), ...getXmlBlocks(voucher, "INVENTORYENTRIES.LIST")]) {
+            const itemName = decodeXmlText(getXmlTag(entry, "STOCKITEMNAME") || getXmlTag(entry, "ITEMNAME")).trim().toLocaleLowerCase();
+            if (!itemName) continue;
+            for (const allocation of getXmlBlocks(entry, "BATCHALLOCATIONS.LIST")) {
+              const orderId = getXmlTag(allocation, "ORDERID").trim();
+              const quantity = parseTallyQuantityParts(getXmlTag(allocation, "ACTUALQTY") || getXmlTag(allocation, "BILLEDQTY"));
+              if (!orderIds.has(orderId) || !quantity) continue;
+              const key = `${orderId}|${itemName}`;
+              fulfilledByOrderItem.set(key, (fulfilledByOrderItem.get(key) ?? 0) + quantity.quantity);
+            }
+          }
+        }
+      }
+    }
+    const rows = orderVouchers.map((voucher) => {
       const date = normalizeTallyDate(getXmlTag(voucher, "DATE"));
       const voucherParty = decodeXmlText(getXmlTag(voucher, "PARTYLEDGERNAME"));
       const entries = [...getXmlBlocks(voucher, "ALLINVENTORYENTRIES.LIST"), ...getXmlBlocks(voucher, "INVENTORYENTRIES.LIST")];
       const items = entries.map((entry) => {
         const ordered = getXmlTag(entry, "BILLEDQTY") || getXmlTag(entry, "ACTUALQTY");
         const pending = getXmlTag(entry, "PENDINGQTY") || getXmlTag(entry, "BALANCEQTY");
-        const orderedValue = Number(ordered.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)?.[0]);
-        const pendingValue = Number(pending.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)?.[0]);
-        const fulfilled = Number.isFinite(orderedValue) && Number.isFinite(pendingValue) ? Math.max(0, orderedValue - pendingValue) : NaN;
+        const quantity = parseTallyQuantityParts(ordered);
+        const orderId = getXmlTag(entry, "ORDERID").trim();
+        const fulfilledValue = fulfilledByOrderItem.get(`${orderId}|${decodeXmlText(getXmlTag(entry, "STOCKITEMNAME") || getXmlTag(entry, "ITEMNAME")).trim().toLocaleLowerCase()}`);
+        const pendingValue = parseTallyQuantityParts(pending);
+        const fulfilled = fulfilledValue ?? (quantity && pendingValue ? Math.max(0, quantity.quantity - pendingValue.quantity) : 0);
+        const remaining = quantity ? Math.max(0, quantity.quantity - fulfilled) : pendingValue?.quantity;
         return {
           name: decodeXmlText(getXmlTag(entry, "STOCKITEMNAME") || getXmlTag(entry, "ITEMNAME")),
           ordered: ordered.trim(),
-          fulfilled: Number.isFinite(fulfilled) ? String(fulfilled) : "",
-          remaining: pending.trim(),
+          fulfilled: quantity ? formatTallyQuantityLike(ordered, fulfilled) : "",
+          remaining: quantity && remaining !== undefined ? formatTallyQuantityLike(ordered, remaining) : pending.trim(),
         };
       }).filter((item) => item.name || item.ordered);
       return {
@@ -990,7 +1067,7 @@ ipcMain.handle("tally:fetch-orders", async (_event, input: unknown) => {
         isPreClosed: getXmlTag(voucher, "ISPRECLOSED").toLowerCase() === "yes",
         items,
       };
-    }).filter((row) => row.party.toLocaleLowerCase() === party.toLocaleLowerCase());
+    });
     return { ok: true, rows };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

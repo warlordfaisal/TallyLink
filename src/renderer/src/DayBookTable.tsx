@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 type DayBookSale = {
   date: string;
@@ -8,7 +8,7 @@ type DayBookSale = {
 };
 type DayBookPayment = { date: string; party: string; amount: number };
 
-const pageSize = 100;
+const pageSize = 50;
 const money = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
@@ -29,38 +29,54 @@ function Pager({
   count,
   page,
   onChange,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: {
   count: number;
   page: number;
   onChange: (page: number) => void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
 }) {
-  const pages = Math.max(1, Math.ceil(count / pageSize));
-  if (count <= pageSize) return null;
+  const loadedPages = Math.max(1, Math.ceil(count / pageSize));
+  const hasLoadedNextPage = page + 1 < loadedPages;
+  const firstPageButton = Math.max(0, Math.min(page - 4, loadedPages - 10));
+  const visiblePages = Array.from(
+    { length: Math.min(10, loadedPages) },
+    (_unused, index) => firstPageButton + index,
+  );
   return (
-    <div className="flex items-center justify-between border-t border-slate-100 px-4 py-2.5 text-[11px] text-slate-600">
-      <span>
-        Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, count)}{" "}
-        of {count.toLocaleString("en-IN")}
-      </span>
-      <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-4 py-2.5 text-[11px] text-slate-600">
+      <span>Page {page + 1} of {loadedPages}{hasMore ? "+" : ""}</span>
+      <div className="flex flex-wrap items-center justify-end gap-1.5">
         <button
           type="button"
           disabled={page === 0}
           onClick={() => onChange(page - 1)}
-          className="rounded-md border border-slate-200 px-2.5 py-1 font-semibold disabled:opacity-40"
+          className="rounded-md border border-slate-200 px-3 py-1.5 font-semibold disabled:opacity-40"
         >
           Previous
         </button>
-        <span>
-          {page + 1} / {pages}
-        </span>
+        {visiblePages.map((pageIndex) => <button
+          key={pageIndex}
+          type="button"
+          aria-current={pageIndex === page ? "page" : undefined}
+          onClick={() => onChange(pageIndex)}
+          className={`min-w-8 rounded-md border px-2.5 py-1.5 font-semibold ${pageIndex === page ? "border-indigo-600 bg-indigo-600 text-white" : "border-slate-200 hover:bg-slate-50"}`}
+        >{pageIndex + 1}</button>)}
+        {loadedPages > firstPageButton + visiblePages.length && <span className="px-1">…</span>}
         <button
           type="button"
-          disabled={page + 1 >= pages}
-          onClick={() => onChange(page + 1)}
-          className="rounded-md border border-slate-200 px-2.5 py-1 font-semibold disabled:opacity-40"
+          disabled={loadingMore || (!hasLoadedNextPage && !hasMore)}
+          onClick={() => {
+            if (hasLoadedNextPage) onChange(page + 1);
+            else if (hasMore) onLoadMore();
+          }}
+          className="rounded-md border border-slate-200 px-3 py-1.5 font-semibold disabled:opacity-40"
         >
-          Next
+          {loadingMore ? "Loading…" : "Next"}
         </button>
       </div>
     </div>
@@ -70,18 +86,19 @@ function Pager({
 export default function DayBookTable({
   sales,
   payments,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: {
   sales: DayBookSale[];
   payments: DayBookPayment[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
 }) {
   const [activeSection, setActiveSection] = useState<"sales" | "payments">("sales");
   const [salesPage, setSalesPage] = useState(0);
   const [paymentsPage, setPaymentsPage] = useState(0);
-  useEffect(() => {
-    setSalesPage(0);
-    setPaymentsPage(0);
-  }, [sales, payments]);
-
   const visibleSales = sales.slice(
     salesPage * pageSize,
     (salesPage + 1) * pageSize,
@@ -90,25 +107,24 @@ export default function DayBookTable({
     paymentsPage * pageSize,
     (paymentsPage + 1) * pageSize,
   );
-
   return (
     <div className="mt-4 min-w-0">
-      <div role="tablist" aria-label="Day Book voucher type" className="relative mb-3 grid w-fit grid-cols-2 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
-        <span aria-hidden="true" className={`absolute bottom-1 top-1 left-1 w-[calc(50%-4px)] rounded-lg bg-indigo-600 shadow-sm transition-transform duration-300 ease-out ${activeSection === "payments" ? "translate-x-full" : "translate-x-0"}`} />
-        <button type="button" role="tab" aria-selected={activeSection === "sales"} onClick={() => setActiveSection("sales")} className={`relative z-[1] rounded-lg px-4 py-2 text-[12px] font-semibold transition-colors duration-200 ${activeSection === "sales" ? "text-white" : "text-slate-600 hover:text-slate-900"}`}>
-          Sales <span className={`ml-1.5 tabular-nums ${activeSection === "sales" ? "text-indigo-100" : "text-slate-400"}`}>{sales.length.toLocaleString("en-IN")}</span>
-        </button>
-        <button type="button" role="tab" aria-selected={activeSection === "payments"} onClick={() => setActiveSection("payments")} className={`relative z-[1] rounded-lg px-4 py-2 text-[12px] font-semibold transition-colors duration-200 ${activeSection === "payments" ? "text-white" : "text-slate-600 hover:text-slate-900"}`}>
-          Payments <span className={`ml-1.5 tabular-nums ${activeSection === "payments" ? "text-indigo-100" : "text-slate-400"}`}>{payments.length.toLocaleString("en-IN")}</span>
-        </button>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div role="tablist" aria-label="Day Book voucher type" className="relative grid w-fit grid-cols-2 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+          <span aria-hidden="true" className={`absolute bottom-1 top-1 left-1 w-[calc(50%-4px)] rounded-lg bg-indigo-600 shadow-sm transition-transform duration-300 ease-out ${activeSection === "payments" ? "translate-x-full" : "translate-x-0"}`} />
+          <button type="button" role="tab" aria-selected={activeSection === "sales"} onClick={() => setActiveSection("sales")} className={`relative z-[1] rounded-lg px-4 py-2 text-[12px] font-semibold transition-colors duration-200 ${activeSection === "sales" ? "text-white" : "text-slate-600 hover:text-slate-900"}`}>
+            Sales
+          </button>
+          <button type="button" role="tab" aria-selected={activeSection === "payments"} onClick={() => setActiveSection("payments")} className={`relative z-[1] rounded-lg px-4 py-2 text-[12px] font-semibold transition-colors duration-200 ${activeSection === "payments" ? "text-white" : "text-slate-600 hover:text-slate-900"}`}>
+            Payments
+          </button>
+        </div>
+        {loadingMore && <span role="status" className="text-[11px] text-slate-600">Loading more…</span>}
       </div>
       {activeSection === "sales" && (
       <section key="sales-daybook" className="min-w-0 animate-[rise-in_.2s_ease-out_both] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
         <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
           <h2 className="text-[14px] font-bold text-slate-900">Sales</h2>
-          <span className="rounded-full bg-violet-50 px-2.5 py-1 text-[11px] font-semibold text-violet-800">
-            {sales.length.toLocaleString("en-IN")}
-          </span>
         </div>
         <div className="max-h-[68vh] overflow-auto">
           <table className="w-full min-w-[620px] border-collapse text-left text-[12px]">
@@ -181,16 +197,13 @@ export default function DayBookTable({
             </tbody>
           </table>
         </div>
-        <Pager count={sales.length} page={salesPage} onChange={setSalesPage} />
+        <Pager count={sales.length} page={salesPage} onChange={setSalesPage} hasMore={hasMore} loadingMore={loadingMore} onLoadMore={onLoadMore} />
       </section>
       )}
       {activeSection === "payments" && (
       <section key="payments-daybook" className="min-w-0 animate-[rise-in_.2s_ease-out_both] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
         <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
           <h2 className="text-[14px] font-bold text-slate-900">Payments</h2>
-          <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-800">
-            {payments.length.toLocaleString("en-IN")}
-          </span>
         </div>
         <div className="max-h-[68vh] overflow-auto">
           <table className="w-full min-w-[420px] border-collapse text-left text-[12px]">
@@ -237,6 +250,9 @@ export default function DayBookTable({
           count={payments.length}
           page={paymentsPage}
           onChange={setPaymentsPage}
+          hasMore={hasMore}
+          loadingMore={loadingMore}
+          onLoadMore={onLoadMore}
         />
       </section>
       )}

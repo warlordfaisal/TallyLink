@@ -55,6 +55,22 @@ function localDate(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
+function dayBookPageRange(from: string, to: string, page: number) {
+  const [year, month, day] = from.split("-").map(Number);
+  const pageStart = new Date(Date.UTC(year, month - 1 + page, page === 0 ? day : 1));
+  const nextMonth = new Date(Date.UTC(year, month + page, 1));
+  const pageEnd = new Date(nextMonth.getTime() - 86400000);
+  const toDate = new Date(`${to}T00:00:00Z`);
+  const asIso = (date: Date) => date.toISOString().slice(0, 10);
+  return { fromDate: asIso(pageStart), toDate: asIso(pageEnd > toDate ? toDate : pageEnd) };
+}
+
+function dayBookPageCount(from: string, to: string) {
+  const [fromYear, fromMonth] = from.split("-").map(Number);
+  const [toYear, toMonth] = to.split("-").map(Number);
+  return (toYear - fromYear) * 12 + toMonth - fromMonth + 1;
+}
+
 const today = new Date();
 const defaultTallyPort = "9000";
 const savedTallyPort = () => {
@@ -135,16 +151,20 @@ export default function App() {
   const [partyVoucherError, setPartyVoucherError] = useState("");
   const [reportError, setReportError] = useState("");
   const [dayBookStatus, setDayBookStatus] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [dayBookLoadingMore, setDayBookLoadingMore] = useState(false);
   const [dayBookError, setDayBookError] = useState("");
   const [dayBookSales, setDayBookSales] = useState<DayBookSale[]>([]);
   const [dayBookPayments, setDayBookPayments] = useState<DayBookPayment[]>([]);
+  const [dayBookRun, setDayBookRun] = useState(0);
   const [partySearch, setPartySearch] = useState("");
+  const [partyDropdownOpen, setPartyDropdownOpen] = useState(false);
   const [selectedParty, setSelectedParty] = useState("");
   const [showSettledInvoices, setShowSettledInvoices] = useState(false);
   const [reportFrom, setReportFrom] = useState(defaultReportFrom);
   const [reportTo, setReportTo] = useState(todayIso);
   const [dayBookFrom, setDayBookFrom] = useState(todayIso);
   const [dayBookTo, setDayBookTo] = useState(todayIso);
+  const [dayBookPage, setDayBookPage] = useState(0);
   const [launchReportAfterSelection, setLaunchReportAfterSelection] =
     useState<"sales" | "daybook" | null>(null);
   useEffect(() => {
@@ -309,7 +329,7 @@ export default function App() {
     }
   };
 
-  const loadDayBook = async (company = selectedCompany) => {
+  const loadDayBook = async (company = selectedCompany, requestedPage = 0, append = false) => {
     if (!company) {
       setLaunchReportAfterSelection("daybook");
       setActiveView("daybook");
@@ -323,26 +343,40 @@ export default function App() {
       return;
     }
     setActiveView("daybook");
-    setDayBookStatus("loading");
+    if (!append) setDayBookPage(requestedPage);
+    if (append) {
+      setDayBookLoadingMore(true);
+    } else {
+      setDayBookRun((run) => run + 1);
+      setDayBookStatus("loading");
+      setDayBookSales([]);
+      setDayBookPayments([]);
+    }
     setDayBookError("");
     try {
+      const pageRange = dayBookPageRange(dayBookFrom, dayBookTo, requestedPage);
       const result = await window.desktop.fetchDayBook({
         company,
         port: connection.port ?? Number(tallyPort),
-        fromDate: dayBookFrom,
-        toDate: dayBookTo,
+        fromDate: pageRange.fromDate,
+        toDate: pageRange.toDate,
       });
       if (!result.ok) throw new Error(result.error || "Tally could not return the Day Book.");
-      setDayBookSales(result.sales ?? []);
-      setDayBookPayments(result.payments ?? []);
+      if (append) setDayBookPage(requestedPage);
+      setDayBookSales((current) => append ? [...current, ...(result.sales ?? [])] : result.sales ?? []);
+      setDayBookPayments((current) => append ? [...current, ...(result.payments ?? [])] : result.payments ?? []);
       setDayBookStatus("loaded");
     } catch (error) {
       setDayBookError(error instanceof Error ? error.message : String(error));
-      setDayBookStatus("error");
+      if (!append) setDayBookStatus("error");
+    } finally {
+      if (append) setDayBookLoadingMore(false);
     }
   };
 
   const selectPartyLedger = async (party: string) => {
+    setPartyDropdownOpen(false);
+    setPartySearch("");
     const requestId = ++partyFetchRequestRef.current;
     setSelectedParty(party);
     setShowSettledInvoices(false);
@@ -398,9 +432,25 @@ export default function App() {
   ]
     .map(([name, summary]) => ({ name, ...summary }))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const visiblePartyLedgers = partyLedgers.filter((ledger) =>
-    ledger.name.toLocaleLowerCase().includes(partySearch.toLocaleLowerCase()),
-  );
+  const visiblePartyLedgers = partyLedgers
+    .map((ledger) => {
+      const query = partySearch.toLocaleLowerCase().trim();
+      const name = ledger.name.toLocaleLowerCase();
+      if (!query) return { ledger, score: 0 };
+      if (name === query) return { ledger, score: 1000 };
+      if (name.startsWith(query)) return { ledger, score: 800 - (name.length - query.length) };
+      if (name.split(/\s+/).some((word) => word.startsWith(query))) return { ledger, score: 650 - name.length * 0.1 };
+      let cursor = 0;
+      for (const char of query) {
+        cursor = name.indexOf(char, cursor);
+        if (cursor < 0) return { ledger, score: -1 };
+        cursor += 1;
+      }
+      return { ledger, score: 350 - (name.length - query.length) * 2 };
+    })
+    .filter(({ score }) => score >= 0)
+    .sort((a, b) => b.score - a.score || a.ledger.name.localeCompare(b.ledger.name))
+    .map(({ ledger }) => ledger);
   const filteredReportRows = selectedParty
     ? (showSettledInvoices
         ? partyVoucherRows
@@ -524,8 +574,9 @@ export default function App() {
                     type="button"
                     role="option"
                     aria-selected={selectedCompany === company}
-                    onClick={() => {
+                    onClick={(event) => {
                       setCompanyMenuOpen(false);
+                      if (event.detail > 0) event.currentTarget.blur();
                       if (company === selectedCompany) return;
                       setCompanyDraft(company);
                       setSelectedCompany(company);
@@ -558,7 +609,7 @@ export default function App() {
         <div className="nav-label sidebar-heading mt-8 px-3">WORKSPACE</div>
         <button
           title="Overview"
-          onClick={() => setActiveView("overview")}
+          onClick={(event) => { setActiveView("overview"); if (event.detail > 0) event.currentTarget.blur(); }}
           className={`${activeView === "overview" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold transition`}
         >
           <LayoutDashboard size={17} />{" "}
@@ -570,7 +621,7 @@ export default function App() {
         <div className="nav-label sidebar-heading mt-8 px-3">YOUR REPORTS</div>
         <button
           title="Sales & collections"
-          onClick={() => void loadSalesReport()}
+          onClick={(event) => { void loadSalesReport(); if (event.detail > 0) event.currentTarget.blur(); }}
           className={`${activeView === "sales" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-[12px] font-semibold transition`}
         >
           <TrendingUp size={16} />{" "}
@@ -578,7 +629,7 @@ export default function App() {
         </button>
         <button
           title="Day Book"
-          onClick={() => void loadDayBook()}
+          onClick={(event) => { void loadDayBook(); if (event.detail > 0) event.currentTarget.blur(); }}
           className={`${activeView === "daybook" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-[12px] font-semibold transition`}
         >
           <NotebookTabs size={16} />
@@ -590,7 +641,7 @@ export default function App() {
 
         <button
           title="Orders"
-          onClick={() => setActiveView("orders")}
+          onClick={(event) => { setActiveView("orders"); if (event.detail > 0) event.currentTarget.blur(); }}
           className={`${activeView === "orders" ? "nav-active" : "text-indigo-100/75 hover:bg-white/[0.06]"} mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-[12px] font-semibold transition`}
         >
           <ClipboardList size={16} />
@@ -603,9 +654,7 @@ export default function App() {
           <div className="relative">
             <button
               title="Settings"
-              onClick={() =>
-                setComingSoonTip(comingSoonTip === "settings" ? "" : "settings")
-              }
+              onClick={(event) => { setComingSoonTip(comingSoonTip === "settings" ? "" : "settings"); if (event.detail > 0) event.currentTarget.blur(); }}
               aria-expanded={comingSoonTip === "settings"}
               className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] text-indigo-100/75 transition hover:bg-white/[0.06] hover:text-white"
             >
@@ -630,7 +679,7 @@ export default function App() {
           <div className="relative">
             <button
               title="Help & support"
-              onClick={() => { setComingSoonTip(""); setActiveView("help"); }}
+              onClick={(event) => { setComingSoonTip(""); setActiveView("help"); if (event.detail > 0) event.currentTarget.blur(); }}
               aria-current={activeView === "help" ? "page" : undefined}
               className={`${activeView === "help" ? "nav-active text-white" : "text-indigo-100/75 hover:bg-white/[0.06] hover:text-white"} flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] transition`}
             >
@@ -969,8 +1018,24 @@ export default function App() {
               )}
 
               {reportStatus === "loaded" && (
-                <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-[240px_minmax(0,1fr)] xl:grid-cols-[340px_minmax(0,1fr)]">
-                  <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <div className="mt-3">
+                  <section className="relative mb-3 min-[1280px]:hidden">
+                    <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-600">Customer account</div>
+                    <button type="button" aria-haspopup="listbox" aria-expanded={partyDropdownOpen} onClick={() => setPartyDropdownOpen((open) => !open)} className="flex h-11 w-full items-center gap-3 rounded-xl border border-slate-200 bg-white px-3 text-left shadow-sm transition hover:border-indigo-300 focus:outline-none focus:ring-2 focus:ring-indigo-200">
+                      <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-slate-800">{selectedParty || "Select a customer account"}</span>
+                      <span className="shrink-0 text-[11px] text-slate-500">{partyLedgers.length.toLocaleString("en-IN")} accounts</span>
+                      <ChevronDown size={16} className={`shrink-0 text-slate-500 transition-transform ${partyDropdownOpen ? "rotate-180" : ""}`} />
+                    </button>
+                    {partyDropdownOpen && <div className="absolute inset-x-0 top-full z-30 mt-2 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+                      <label className="flex h-11 items-center gap-2 border-b border-slate-100 px-3 text-slate-500"><Search size={16} /><input autoFocus value={partySearch} onChange={(event) => setPartySearch(event.target.value)} placeholder="Search accounts (fuzzy match)" className="min-w-0 flex-1 bg-transparent text-[13px] text-slate-800 outline-none placeholder:text-slate-400" /></label>
+                      <div role="listbox" aria-label="Customer accounts" className="max-h-[min(55vh,420px)] overflow-y-auto p-1.5">
+                        {visiblePartyLedgers.map((ledger) => <button key={ledger.name} type="button" role="option" aria-selected={selectedParty === ledger.name} onClick={() => void selectPartyLedger(ledger.name)} className={`mb-1 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition last:mb-0 ${selectedParty === ledger.name ? "bg-indigo-50 text-indigo-900" : "text-slate-800 hover:bg-slate-50"}`}><span className="min-w-0 flex-1 truncate text-[13px] font-semibold">{ledger.name}</span><span className="shrink-0 text-[11px] font-medium text-slate-500">{ledger.invoices.toLocaleString("en-IN")} inv.</span><span className="shrink-0 text-[11px] font-semibold text-amber-800">Due {formatMoney.format(ledger.balance)}</span></button>)}
+                        {visiblePartyLedgers.length === 0 && <div className="px-3 py-8 text-center text-[13px] text-slate-500">No matching accounts</div>}
+                      </div>
+                    </div>}
+                  </section>
+                  <div className="grid grid-cols-1 gap-3 min-[1280px]:grid-cols-[340px_minmax(0,1fr)]">
+                  <section className="hidden overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm min-[1280px]:block">
                     <div className="border-b border-slate-100 bg-gradient-to-r from-indigo-50 to-white px-4 pb-4 pt-5">
                       <div className="flex items-center justify-between">
                         <div>
@@ -1105,6 +1170,7 @@ export default function App() {
                       </div>
                     </section>
                   )}
+                  </div>
                 </div>
               )}
 
@@ -1149,11 +1215,11 @@ export default function App() {
                 <div className="flex flex-wrap items-end gap-2 rounded-xl border border-slate-200 bg-white p-2 shadow-sm">
                   <label className="grid gap-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-600">
                     From
-                    <input type="date" value={dayBookFrom} max={dayBookTo} onChange={(event) => setDayBookFrom(event.target.value)} className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[12px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400" />
+                    <input type="date" value={dayBookFrom} max={dayBookTo} onChange={(event) => { setDayBookFrom(event.target.value); setDayBookPage(0); }} className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[12px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400" />
                   </label>
                   <label className="grid gap-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-600">
                     To
-                    <input type="date" value={dayBookTo} min={dayBookFrom} max={todayIso} onChange={(event) => setDayBookTo(event.target.value)} className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[12px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400" />
+                    <input type="date" value={dayBookTo} min={dayBookFrom} max={todayIso} onChange={(event) => { setDayBookTo(event.target.value); setDayBookPage(0); }} className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2 text-[12px] font-semibold normal-case tracking-normal text-slate-900 outline-none focus:border-indigo-400" />
                   </label>
                   <button type="button" disabled={dayBookStatus === "loading"} onClick={() => void loadDayBook()} className="connect-action inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-[12px] font-bold text-white disabled:opacity-60">
                     <ArrowDownToLine size={14} /> Refresh
@@ -1173,7 +1239,17 @@ export default function App() {
                 </div>
               )}
               {dayBookStatus === "loaded" && (
-                <DayBookTable key={`${selectedCompany}-${dayBookFrom}-${dayBookTo}`} sales={dayBookSales} payments={dayBookPayments} />
+                <>
+                {dayBookError && <div role="alert" className="mt-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-[12px] text-rose-900">{dayBookError}</div>}
+                <DayBookTable
+                  key={`${selectedCompany}-${dayBookFrom}-${dayBookTo}-${dayBookRun}`}
+                  sales={dayBookSales}
+                  payments={dayBookPayments}
+                  hasMore={dayBookPage + 1 < dayBookPageCount(dayBookFrom, dayBookTo)}
+                  loadingMore={dayBookLoadingMore}
+                  onLoadMore={() => void loadDayBook(selectedCompany, dayBookPage + 1, true)}
+                />
+                </>
               )}
               {dayBookStatus === "idle" && (
                 <div className="mt-5 rounded-xl border border-slate-200 bg-white p-8 text-center">
